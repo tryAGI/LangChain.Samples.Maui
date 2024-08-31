@@ -1,7 +1,9 @@
 using LangChain.Databases.InMemory;
 using LangChain.Providers.OpenAI.Predefined;
-using LangChain.Sources;
-using LangChain.VectorStores;
+using LangChain.DocumentLoaders;
+using LangChain.Databases;
+using LangChain.Extensions;
+using LangChain.Providers;
 
 namespace LangChain.Samples.Maui.ViewModels;
 
@@ -9,7 +11,9 @@ public partial class RetrievalAugmentedGenerationViewModel(
 	IFilePicker filePicker)
 	: ObservableObject
 {
-	private VectorStore? _database;
+	private IVectorDatabase? _database;
+	private IVectorCollection? _collection;
+	private IEmbeddingModel? _embeddings;
 	
 	[ObservableProperty]
 	private string _status = string.Empty;
@@ -43,6 +47,9 @@ public partial class RetrievalAugmentedGenerationViewModel(
 	{
 		try
 		{
+			_embeddings ??= new TextEmbeddingV3SmallModel(ApiKey);
+			_database ??= new InMemoryVectorDatabase();
+			
 			var result = await filePicker.PickAsync();
 			if (result == null)
 			{
@@ -53,13 +60,13 @@ public partial class RetrievalAugmentedGenerationViewModel(
 			Status = $"Selected file: {result.FileName}. Creating embeddings...";
 			
 			await using var stream = await result.OpenReadAsync();
-			var documents = await PdfPigPdfSource.FromStreamAsync(
-				stream, cancellationToken);
 			
-			var embeddings = new TextEmbeddingV3SmallModel(ApiKey);
-			var database = await InMemoryVectorStore.CreateIndexFromDocuments(
-				embeddings, documents);
-			_database = database.Store;
+			_collection = await _database.AddDocumentsFromAsync<PdfPigPdfLoader>(
+				_embeddings, // Used to convert text to embeddings
+				dimensions: 1536, // Should be 1536 for TextEmbeddingV3SmallModel
+				dataSource: DataSource.FromStream(stream),
+				collectionName: result.FileName,
+				cancellationToken: cancellationToken);
 			
 			Status = "Embeddings created. You can ask question now.";
 		}
@@ -80,17 +87,17 @@ public partial class RetrievalAugmentedGenerationViewModel(
 	{
 		try
 		{
-			Status = "Loading file...";
-			
-			var documents = await PdfPigPdfSource.FromUriAsync(
-				new Uri(PdfUrl), cancellationToken);
+			_embeddings ??= new TextEmbeddingV3SmallModel(ApiKey);
+			_database ??= new InMemoryVectorDatabase();
 			
 			Status = "Creating embeddings...";
 			
-			var embeddings = new TextEmbeddingV3SmallModel(ApiKey);
-			var database = await InMemoryVectorStore.CreateIndexFromDocuments(
-				embeddings, documents);
-			_database = database.Store;
+			_collection = await _database.AddDocumentsFromAsync<PdfPigPdfLoader>(
+				_embeddings, // Used to convert text to embeddings
+				dimensions: 1536, // Should be 1536 for TextEmbeddingV3SmallModel
+				dataSource: DataSource.FromUrl(PdfUrl),
+				collectionName: PdfUrl,
+				cancellationToken: cancellationToken);
 			
 			Status = "Embeddings created. You can ask question now.";
 		}
@@ -102,7 +109,7 @@ public partial class RetrievalAugmentedGenerationViewModel(
 	
 	private bool CanAskQuestion()
 	{
-		return _database != null &&
+		return _collection != null &&
 		       !string.IsNullOrWhiteSpace(Question);
 	}
 
@@ -111,17 +118,18 @@ public partial class RetrievalAugmentedGenerationViewModel(
 	{
 		try
 		{
-			if (_database == null)
+			_embeddings ??= new TextEmbeddingV3SmallModel(ApiKey);
+			if (_collection == null)
 			{
 				return;
 			}
 			
-			var gpt35 = new Gpt35TurboModel(ApiKey);
+			var llm = new Gpt4OmniModel(ApiKey);
 			
 			Status = "Finding similar documents...";
 			
-			var similarDocuments = await _database.GetSimilarDocuments(
-				Question, amount: 5);
+			var similarDocuments = await _collection.GetSimilarDocuments(
+				_embeddings, Question, amount: 5);
 
 			Prompt =
 				$"""
@@ -136,7 +144,7 @@ public partial class RetrievalAugmentedGenerationViewModel(
 				 """;
 			Status = "Generating answer...";
 			
-			var response = await gpt35.GenerateAsync(
+			var response = await llm.GenerateAsync(
 				Prompt, cancellationToken: CancellationToken.None).ConfigureAwait(false);
         
 			Answer = response.LastMessageContent;
